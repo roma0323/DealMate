@@ -12,7 +12,7 @@ import os
 import threading
 import time
 
-from . import db, llm
+from . import db, llm, photos
 from .notify import send_email_async
 
 log = logging.getLogger("dealmate.engine")
@@ -63,7 +63,7 @@ def parties(conn, negotiation_id: int) -> dict:
     return db.row(
         conn,
         """
-        SELECT n.*, l.title, l.condition, l.location AS listing_location, l.ask_price,
+        SELECT n.*, l.title, l.condition, l.location AS listing_location, l.ask_price, l.photo_path,
                l.floor_price, l.auto_accept_price, w.description AS want_description, w.budget,
                s.name AS seller_name, s.email AS seller_email,
                b.name AS buyer_name, b.email AS buyer_email
@@ -137,12 +137,19 @@ def run_negotiation(negotiation_id: int) -> None:
 
     # Only on the first run: a run resumed after answer_agent doesn't repeat them.
     if just_matched:
-        notify_both(
-            p,
-            f"DealMate：「{p['title']}」配對成功",
-            f"您的「{p['title']}」找到了交易對象。\n"
-            f"賣家地點：{p['listing_location'] or '未提供'}\n"
+        subject = f"DealMate：「{p['title']}」配對成功"
+        send_email_async(
+            p["seller_email"], subject,
+            f"您的「{p['title']}」找到了想買的人。\n您的代理人接下來會開始議價。",
+        )
+        # The buyer sees what they are getting: description, location, and the photo if there is one.
+        send_email_async(
+            p["buyer_email"], subject,
+            f"找到符合您需求的商品：「{p['title']}」\n"
+            f"狀況：{p['condition'] or '未提供'}\n"
+            f"地點：{p['listing_location'] or '未提供'}\n"
             "您的代理人接下來會開始議價。",
+            image=photos.photo_file(p),
         )
         notify_both(
             p,

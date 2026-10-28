@@ -1,5 +1,7 @@
 """DealMate MCP server: the tools Claude calls through the custom connector."""
 
+import base64
+import binascii
 import logging
 import os
 from typing import Literal
@@ -7,9 +9,10 @@ from typing import Literal
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.utilities.types import Image
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import db, engine
+from . import db, engine, photos
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -21,9 +24,11 @@ mcp = MCPServer(
         "The user's agent negotiates with the other side's agent on the DealMate server; "
         "the user only describes what they want, answers questions when asked, and confirms the final deal. "
         "Always call register_user first with the user's name and email if they have not registered. "
-        "Pass the same `user` name on every later call. Reply to the user in Traditional Chinese."
+        "Pass the same `user` name on every later call. Reply to the user in Traditional Chinese. "
+        "Sellers can add a photo: give them the upload_url that create_listing returns."
     ),
 )
+photos.register_routes(mcp)
 
 
 def _require_user(conn, user: str) -> dict:
@@ -69,6 +74,9 @@ def create_listing(
     - auto_accept_price: at or above this, the agent may agree without asking them;
       below it (but above the floor), the agent will ask them first
     `category` is a short keyword used for matching, e.g. "水壺", "耳機", "書".
+
+    Returns `upload_url`: always give this link to the seller so they can add a photo
+    of the item from their phone or computer (the chat attachment itself can't be passed on).
     """
     if not (floor_price <= auto_accept_price <= ask_price):
         raise ToolError("價格需符合：底價 ≤ 自動接受價 ≤ 開價。")
@@ -80,10 +88,65 @@ def create_listing(
             (seller["id"], category, title, condition, location, ask_price, floor_price, auto_accept_price),
         )
         listing_id = cur.lastrowid
+        token = photos.ensure_upload_token(conn, listing_id)
         neg_id = engine.find_match_for_listing(conn, listing_id)
     if neg_id:
         engine.start_negotiation_async(neg_id)
-    return {"listing_id": listing_id, "matched": bool(neg_id), "negotiation_id": neg_id}
+    return {
+        "listing_id": listing_id,
+        "matched": bool(neg_id),
+        "negotiation_id": neg_id,
+        "upload_url": photos.upload_url(token),
+    }
+
+
+@mcp.tool()
+def upload_photo(user: str, listing_id: int, image_base64: str) -> dict:
+    """Seller: attach a photo to their listing by sending the image as base64.
+
+    Only practical for small images. If the image is large, or this fails, give the
+    seller the upload_url from create_listing / check_status instead.
+    """
+    try:
+        data = base64.b64decode(image_base64.split(",")[-1], validate=False)
+    except (binascii.Error, ValueError):
+        raise ToolError("圖片的 base64 內容無法解讀，請改用上傳連結。")
+    with db.connect() as conn:
+        seller = _require_user(conn, user)
+        listing = db.row(conn, "SELECT id FROM listings WHERE id = ? AND seller_id = ?", listing_id, seller["id"])
+        if listing is None:
+            raise ToolError("找不到這位賣家的這件商品。")
+        try:
+            url = photos.save_photo(conn, listing_id, data)
+        except ValueError as e:
+            raise ToolError(f"{e} 也可以改用上傳連結。")
+    return {"listing_id": listing_id, "photo_url": url}
+
+
+@mcp.tool()
+def view_listing_photo(user: str, listing_id: int) -> Image:
+    """Look at the photo of a listing, so you can describe the item to the user.
+
+    The seller can view their own listings; a buyer can view a listing they are negotiating for.
+    """
+    with db.connect() as conn:
+        u = _require_user(conn, user)
+        listing = db.row(
+            conn,
+            """
+            SELECT l.* FROM listings l
+            WHERE l.id = ? AND (l.seller_id = ? OR EXISTS (
+                SELECT 1 FROM negotiations n JOIN wants w ON w.id = n.want_id
+                WHERE n.listing_id = l.id AND w.buyer_id = ?))
+            """,
+            listing_id, u["id"], u["id"],
+        )
+    if listing is None:
+        raise ToolError("找不到這件商品，或您沒有在跟它議價。")
+    path = photos.photo_file(listing)
+    if path is None:
+        raise ToolError("這件商品還沒有照片。")
+    return Image(data=path.read_bytes(), format=photos.detect_type(path.read_bytes()[:16])[0].replace("jpg", "jpeg"))
 
 
 @mcp.tool()
@@ -119,10 +182,14 @@ def check_status(user: str) -> dict:
         u = _require_user(conn, user)
         listings = db.rows(
             conn,
-            "SELECT id, category, title, ask_price, floor_price, auto_accept_price, status "
+            "SELECT id, category, title, ask_price, floor_price, auto_accept_price, status, photo_path "
             "FROM listings WHERE seller_id = ?",
             u["id"],
         )
+        for l in listings:
+            l["photo_url"] = photos.photo_url(l["id"]) if photos.photo_file(l) else None
+            l["upload_url"] = photos.upload_url(photos.ensure_upload_token(conn, l["id"]))
+            del l["photo_path"]
         wants = db.rows(
             conn, "SELECT id, category, description, budget, status FROM wants WHERE buyer_id = ?", u["id"]
         )
@@ -130,7 +197,7 @@ def check_status(user: str) -> dict:
             conn,
             """
             SELECT n.id, n.state, n.round, n.agreed_price, n.pending_party, n.pending_question,
-                   n.seller_confirmed, n.buyer_confirmed, l.title,
+                   n.seller_confirmed, n.buyer_confirmed, n.listing_id, l.title, l.photo_path,
                    CASE WHEN l.seller_id = ? THEN 'seller' ELSE 'buyer' END AS my_role,
                    CASE WHEN l.seller_id = ? THEN n.seller_report ELSE n.buyer_report END AS my_report
             FROM negotiations n
@@ -142,6 +209,8 @@ def check_status(user: str) -> dict:
             u["id"], u["id"], u["id"], u["id"],
         )
         for n in negs:
+            n["photo_url"] = photos.photo_url(n["listing_id"]) if photos.photo_file(n) else None
+            del n["photo_path"]
             # Only show a pending question to the party it is addressed to.
             n["waiting_for_me"] = n["state"] == "waiting_user" and n["pending_party"] == n["my_role"]
             if not n["waiting_for_me"]:

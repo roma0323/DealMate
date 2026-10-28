@@ -92,6 +92,7 @@ def connect():
 _ADDED_COLUMNS = [
     ("negotiations", "seller_report", "TEXT"),
     ("negotiations", "buyer_report", "TEXT"),
+    ("listings", "upload_token", "TEXT"),   # secret part of the photo upload link
 ]
 
 
