@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS negotiations (
     pending_question  TEXT,
     seller_confirmed  INTEGER NOT NULL DEFAULT 0,
     buyer_confirmed   INTEGER NOT NULL DEFAULT 0,
+    seller_report     TEXT,                              -- shown only to the seller
+    buyer_report      TEXT,                              -- shown only to the buyer
     updated_at        TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -77,11 +79,27 @@ def connect():
     conn.execute("PRAGMA foreign_keys = ON")
     # Cheap with IF NOT EXISTS, and recreates the tables if dealmate.db is deleted while running.
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+# Columns added after the first version: (table, column, type).
+# CREATE TABLE IF NOT EXISTS doesn't add them to an existing dealmate.db, so add them here.
+_ADDED_COLUMNS = [
+    ("negotiations", "seller_report", "TEXT"),
+    ("negotiations", "buyer_report", "TEXT"),
+]
+
+
+def _add_missing_columns(conn) -> None:
+    for table, column, type_ in _ADDED_COLUMNS:
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_}")
 
 
 def init_db() -> None:

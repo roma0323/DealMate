@@ -111,6 +111,8 @@ def check_status(user: str) -> dict:
     """Show the user's listings, wants and negotiations, including the offer history
     and any question their agent is waiting for them to answer.
 
+    Once a price is agreed, `my_report` holds the agent's report for this user:
+    show it to them and ask them to confirm with confirm_deal.
     Call this whenever the user asks how things are going.
     """
     with db.connect() as conn:
@@ -129,14 +131,15 @@ def check_status(user: str) -> dict:
             """
             SELECT n.id, n.state, n.round, n.agreed_price, n.pending_party, n.pending_question,
                    n.seller_confirmed, n.buyer_confirmed, l.title,
-                   CASE WHEN l.seller_id = ? THEN 'seller' ELSE 'buyer' END AS my_role
+                   CASE WHEN l.seller_id = ? THEN 'seller' ELSE 'buyer' END AS my_role,
+                   CASE WHEN l.seller_id = ? THEN n.seller_report ELSE n.buyer_report END AS my_report
             FROM negotiations n
             JOIN listings l ON l.id = n.listing_id
             JOIN wants w ON w.id = n.want_id
             WHERE l.seller_id = ? OR w.buyer_id = ?
             ORDER BY n.id
             """,
-            u["id"], u["id"], u["id"],
+            u["id"], u["id"], u["id"], u["id"],
         )
         for n in negs:
             # Only show a pending question to the party it is addressed to.
