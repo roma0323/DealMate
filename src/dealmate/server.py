@@ -5,7 +5,7 @@ import binascii
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
@@ -35,7 +35,9 @@ mcp = MCPServer(
         "wish into a budget range and conditions with the guide's keys, then call create_want. Remind the "
         "buyer of the guide's checklist; answer from the listing when it says so, otherwise use ask_seller. "
         "When the buyer decides, call request_purchase.\n"
-        "Sellers add a photo with the upload button on the listing card that create_listing shows."
+        "Photos: sellers upload with the upload button on the listing card that create_listing shows; "
+        "upload_photo is only a fallback for small images where cards don't show. "
+        "When a user wants to see an item's photo, use view_listing_photo_for_human."
     ),
     extensions=[ui.apps],
 )
@@ -121,7 +123,7 @@ def get_category_guide(category: str) -> dict:
     return checklists.guide(category)
 
 
-@mcp.tool(meta=ui_meta())
+@mcp.tool(meta=ui_meta(), structured_output=True)
 def create_listing(
     user: str,
     category: str,
@@ -136,7 +138,7 @@ def create_listing(
     needs_truck: bool = False,
     meetup_slots: list[Slot] | None = None,
     meetup_stations: list[str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Seller: put an item up for sale at a fixed price (no bargaining).
 
     Before calling: call get_category_guide; if the user attached a photo, identify the
@@ -147,7 +149,8 @@ def create_listing(
     meetup_slots / meetup_stations update when and where the seller can meet up.
 
     Buyers whose wants this item meets are emailed. The result is shown as a listing card
-    with an upload button, so the seller can add a photo right in the chat.
+    with an upload button: tell the seller to add the photo there (the photo they gave you
+    in the chat is not uploaded automatically).
     """
     specs = checklists.label_specs(category, _checked(engine.check_specs, specs or []))
     with db.connect() as conn:
@@ -173,7 +176,7 @@ def create_listing(
     }
 
 
-@mcp.tool(meta=ui_meta())
+@mcp.tool(meta=ui_meta(), structured_output=True)
 def update_listing(
     user: str,
     listing_id: int,
@@ -186,7 +189,7 @@ def update_listing(
     size: str | None = None,
     needs_disassembly: bool | None = None,
     needs_truck: bool | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Seller: change their listing. Only the given fields change.
 
     `specs` are merged by key: a spec with an existing key replaces it, a new key is added.
@@ -225,13 +228,14 @@ def update_listing(
     }
 
 
-@mcp.tool(meta=ui_meta())
-def show_listing(user: str, listing_id: int) -> dict:
+@mcp.tool(meta=ui_meta(), structured_output=True)
+def show_listing(user: str, listing_id: int) -> dict[str, Any]:
     """Show one item as a card with its photo, specs (with their sources) and public Q&A.
 
     Read `specs`, `description` and `qa` before asking the seller anything: if they already
     answer the buyer's question, answer it from there.
     For the item's seller the card also has an upload button for adding or changing the photo.
+    To show the photo itself as a file, use view_listing_photo_for_human.
     """
     with db.connect() as conn:
         u = _require_user(conn, user)
@@ -246,8 +250,8 @@ def show_listing(user: str, listing_id: int) -> dict:
     return result
 
 
-@mcp.tool(meta=ui_meta(app_only=True))
-def app_get_photo(listing_id: int) -> dict:
+@mcp.tool(meta=ui_meta(app_only=True), structured_output=True)
+def app_get_photo(listing_id: int) -> dict[str, Any]:
     """Used by the DealMate card to display a listing photo. Not for the model."""
     with db.connect() as conn:
         listing = db.row(conn, "SELECT photo_path FROM listings WHERE id = ?", listing_id)
@@ -259,8 +263,8 @@ def app_get_photo(listing_id: int) -> dict:
     return {"listing_id": listing_id, "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
 
 
-@mcp.tool(meta=ui_meta(app_only=True))
-def app_upload_photo(upload_token: str, image_base64: str) -> dict:
+@mcp.tool(meta=ui_meta(app_only=True), structured_output=True)
+def app_upload_photo(upload_token: str, image_base64: str) -> dict[str, Any]:
     """Used by the DealMate card's upload button. Not for the model."""
     try:
         data = base64.b64decode(image_base64.split(",")[-1])
@@ -278,16 +282,20 @@ def app_upload_photo(upload_token: str, image_base64: str) -> dict:
 
 
 @mcp.tool()
-def upload_photo(user: str, listing_id: int, image_base64: str) -> dict:
-    """Seller: attach a photo to their listing by sending the image as base64.
+def upload_photo(user: str, listing_id: int, content: str, mimeType: str = "", title: str = "") -> dict:
+    """Seller: upload a photo by sending the file as base64. Fallback only.
 
-    Only practical for small images. If the image is large, or this fails, ask the
-    seller to use the upload button on the listing card (show_listing) instead.
+    The normal way is the upload button on the listing card (create_listing / show_listing).
+    Use this only where the card isn't shown (e.g. Claude Code) and the image is small:
+    every base64 character has to be written out, so a large image takes minutes. If you
+    can run code, first resize it to about 400 px on the long side as JPEG.
+    `content` is the file's bytes in base64 (a data: URL also works), with its `mimeType`
+    and file name `title`; the image type is checked from the bytes.
     """
     try:
-        data = base64.b64decode(image_base64.split(",")[-1], validate=False)
+        data = base64.b64decode("".join(content.split(",")[-1].split()), validate=True)
     except (binascii.Error, ValueError):
-        raise ToolError("圖片的 base64 內容無法解讀，請改用商品卡片上的上傳按鈕。")
+        raise ToolError("content 不是有效的 base64。請把圖片檔案的內容整個轉成 base64 再傳。")
     with db.connect() as conn:
         seller = _require_user(conn, user)
         listing = db.row(conn, "SELECT id FROM listings WHERE id = ? AND seller_id = ?", listing_id, seller["id"])
@@ -297,7 +305,8 @@ def upload_photo(user: str, listing_id: int, image_base64: str) -> dict:
             photos.save_photo(conn, listing_id, data)
         except ValueError as e:
             raise ToolError(f"{e} 也可以改用商品卡片上的上傳按鈕。")
-    return {"listing_id": listing_id, "has_photo": True}
+    ext, mime = photos.detect_type(data[:16])
+    return {"listing_id": listing_id, "has_photo": True, "mimeType": mime, "size_bytes": len(data)}
 
 
 def _viewable_photo(user: str, listing_id: int) -> tuple[dict, bytes]:
@@ -318,8 +327,8 @@ def view_listing_photo_for_ai(user: str, listing_id: int) -> Image:
     """Look at a listing's photo yourself, e.g. to identify the model and look up its specs,
     or to answer a buyer's question from the photo.
 
-    Returns the image for you (the AI) to see; it is not shown to the user as a file.
-    To show the photo to the user, use view_listing_photo_for_human.
+    Only for your own analysis: the user does not get the photo this way. When the user
+    wants to see the photo, use view_listing_photo_for_human instead.
     """
     _, data = _viewable_photo(user, listing_id)
     return Image(data=data, format=photos.detect_type(data[:16])[0].replace("jpg", "jpeg"))
@@ -327,7 +336,8 @@ def view_listing_photo_for_ai(user: str, listing_id: int) -> Image:
 
 @mcp.tool()
 def view_listing_photo_for_human(user: str, listing_id: int) -> dict:
-    """Download a listing's photo as a base64 encoded string, to show it to the user.
+    """Download a listing's photo, to show it to the user. Use this whenever the user asks
+    to see an item's photo ("給我看照片", "長什麼樣子").
 
     Same shape as a Drive file download: `content` is the file's bytes in base64,
     with `mimeType` and `title` (a file name). Decode `content` into a file named
@@ -344,7 +354,7 @@ def view_listing_photo_for_human(user: str, listing_id: int) -> dict:
     }
 
 
-@mcp.tool(meta=ui_meta())
+@mcp.tool(meta=ui_meta(), structured_output=True)
 def create_want(
     user: str,
     category: str,
@@ -355,7 +365,7 @@ def create_want(
     location: str = "",
     meetup_slots: list[Slot] | None = None,
     meetup_stations: list[str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Buyer: describe something to buy. Matching items are returned now, and the want
     stays open: when a matching item is listed later, the buyer is emailed.
 
@@ -395,8 +405,8 @@ def create_want(
 DEBUG = os.environ.get("DEALMATE_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
 
-@mcp.tool(meta=ui_meta())
-def browse_listings(include_closed: bool = False, category: str = "") -> dict:
+@mcp.tool(meta=ui_meta(), structured_output=True)
+def browse_listings(include_closed: bool = False, category: str = "") -> dict[str, Any]:
     """Browse every item on DealMate with its public details, optionally only one category.
     The result is shown as product cards with photos.
 

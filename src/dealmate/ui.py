@@ -104,7 +104,10 @@ APP_HTML = r"""<!doctype html>
     if (!r) return null;
     if (r.structuredContent) return r.structuredContent;
     const text = (r.content || []).filter(c => c.type === "text").map(c => c.text).join("");
-    try { return JSON.parse(text); } catch (e) { return { view: "error", error: text }; }
+    try { return JSON.parse(text); } catch (e) {}
+    // Some hosts append a note after the JSON ("[This tool call rendered an interactive widget…]").
+    const start = text.indexOf("{"), end = text.lastIndexOf("}");
+    try { return JSON.parse(text.slice(start, end + 1)); } catch (e) { return { view: "error", error: text }; }
   }
 
   async function callTool(name, args) {

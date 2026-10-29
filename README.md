@@ -23,7 +23,7 @@
 
 | 步驟 | 使用者說 | Claude 做的事 | 呼叫的 tool |
 |---|---|---|---|
-| 賣家上架 | 「我要賣這盞燈，用了一年，500 元，平日晚上南港站或汐止站可以面交」 | 讀品類指南、從照片辨識型號、查規格和新品價，整理草稿給賣家確認 | `get_category_guide` → `create_listing` |
+| 賣家上架 | 「我要賣這盞燈，用了一年，500 元，平日晚上南港站或汐止站可以面交」 | 讀品類指南、從照片辨識型號、查規格和新品價，整理草稿給賣家確認；上架後請賣家用卡片按鈕上傳照片 | `get_category_guide` → `create_listing` |
 | 買家交代需求 | 「想找落地燈，要能用 LED，預算 300～600，平日晚上公館或南港」 | 把需求轉成條件（`led_ok = true`），提醒檢查清單 | `get_category_guide` → `create_want` |
 | 配對 | — | 現在就有的直接顯示成商品卡片；之後上架的寄信通知 | （自動） |
 | 問問題 | 「可以調光嗎？」 | 先看商品介紹；答不出來就寄信問賣家 | `show_listing` → `ask_seller` |
@@ -82,17 +82,24 @@ Claude.ai 網頁版與桌面版會把下面這些 tool 的結果畫成互動卡�
 | `create_listing`、`update_listing`、`show_listing` | 單一商品：照片、介紹、規格與來源、尺寸與搬運、公開問答；賣家看到上傳照片按鈕 |
 
 - 照片由卡片向 server 要（`app_get_photo`），上傳也由卡片送出（`app_upload_photo`），照片資料不會進到 Claude 的對話。
-- 不支援卡片的地方（例如 Claude Code）只會看到文字結果；小圖可以改用 `upload_photo`。
+- 不支援卡片的地方（例如 Claude Code）只會看到文字結果，也就沒有上傳按鈕；小圖可以改用 `upload_photo`。
 
 ## 照片
 
+`upload_photo` 和 `view_listing_photo_for_human` 用和 Google Drive 一樣的格式：`content`（檔案內容的 base64）、`mimeType`、`title`（檔名）。
+
+為什麼上傳不用 base64、下載可以：上傳時 base64 是 Claude 要自己一個字一個字寫出來的參數，一張圖要好幾分鐘；下載時 base64 在 tool 的回傳結果裡，Claude 只要讀，再用沙盒裡的小段 Python 解碼成檔案，很快。
+
 | 做什麼 | 怎麼做 |
 |---|---|
-| 上傳照片 | 上架後的商品卡片上按「上傳照片」；或請 Claude 顯示商品（`show_listing`） |
-| 給 Claude 看照片 | `view_listing_photo_for_ai`：Claude 直接看圖，可以辨識型號 |
-| 給人看照片 | `view_listing_photo_for_human`：格式和 Google Drive 下載檔案一樣，Claude 會還原成圖片檔 |
+| 上傳照片（主要） | 上架後的商品卡片上按「上傳照片」；或請 Claude 顯示商品（`show_listing`），賣家看到的卡片有上傳按鈕。照片在瀏覽器裡縮小後直接傳給 server，不經過 Claude，一兩秒就好 |
+| 上傳照片（備用） | 沒有卡片的地方（例如 Claude Code）用 `upload_photo`，只適合很小的圖（Claude 會先縮到長邊約 400 px） |
+| 使用者想看照片 | `view_listing_photo_for_human`：像從 Drive 下載檔案，Claude 把 `content` 還原成圖片檔給使用者看（需要 Claude 開啟程式執行） |
+| Claude 自己看照片 | `view_listing_photo_for_ai`：只給 Claude 辨識型號、回答問題用，使用者不會拿到照片 |
+| 瀏覽時看照片 | 商品卡片會直接顯示照片 |
 
-照片存在專案資料夾的 `photos/`。新商品配對到買家時，通知信會直接附上照片。
+- 照片存在專案資料夾的 `photos/`，每件商品一張，換照片會取代舊的。上限 8 MB，只接受 JPG、PNG、GIF、WebP（看檔案內容判斷，不看副檔名）。
+- 新商品配對到買家時，通知信會附上照片。但通知信是在 `create_listing` 時寄出，那時賣家還沒按卡片上傳，所以上架當下就配對到的買家收到的信不會有照片。
 
 ## 除錯模式
 
