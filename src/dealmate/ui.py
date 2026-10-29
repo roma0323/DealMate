@@ -2,9 +2,9 @@
 
 One HTML view serves every UI-bound tool; it picks what to draw from the tool
 result's `view` field:
-- "gallery": product cards with photos (browse_listings)
-- "listing": one product with its photo, and an upload button for the seller
-  (create_listing, show_listing)
+- "gallery": product cards with photos (browse_listings, create_want)
+- "listing": one product with its photo, specs and public Q&A, and an upload
+  button for the seller (create_listing, update_listing, show_listing)
 
 The page talks to the host over postMessage JSON-RPC (MCP Apps, 2026-01-26):
 ui/initialize -> ui/notifications/initialized, then it receives
@@ -53,7 +53,12 @@ APP_HTML = r"""<!doctype html>
   .meta { color:var(--muted); font-size:12px; margin-top:4px; line-height:1.4; }
   .badge { display:inline-block; font-size:11px; padding:1px 7px; border-radius:99px; color:#fff; margin-left:4px;
            vertical-align:2px; }
-  .open { background:var(--ok); } .matched { background:var(--warn); } .sold,.closed { background:var(--off); }
+  .open { background:var(--ok); } .reserved { background:var(--warn); } .sold,.closed { background:var(--off); }
+  .src { font-size:10px; color:var(--muted); border:1px solid var(--line); border-radius:4px; padding:0 4px;
+         margin-left:4px; white-space:nowrap; }
+  .desc { white-space:pre-wrap; line-height:1.5; margin:6px 0; }
+  .warn { color:var(--warn); font-size:12px; margin-top:4px; }
+  .qa { margin-top:6px; } .qa div { margin-top:4px; } .qa b { font-weight:600; }
   details { margin-top:6px; font-size:12px; } summary { cursor:pointer; color:var(--accent); }
   table { border-collapse:collapse; width:100%; margin-top:4px; }
   td { padding:2px 0; vertical-align:top; } td:first-child { color:var(--muted); width:42%; }
@@ -123,28 +128,37 @@ APP_HTML = r"""<!doctype html>
   const root = document.getElementById("root");
   const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const money = n => n == null ? "" : "NT$ " + Number(n).toLocaleString("en-US");
-  const STATUS = { open: "在售", matched: "議價中", sold: "已售出", closed: "已下架" };
-  const STATE = { matched: "已配對", negotiating: "議價中", waiting_user: "等本人決定",
-                  agreed: "已談成", closed: "已成交", failed: "未成交" };
+  const STATUS = { open: "在售", reserved: "已有人要", sold: "已售出", closed: "已下架" };
+  const STATE = { requested: "等賣家確認", confirmed: "已成交，待約面交", scheduled: "已約面交", cancelled: "已取消" };
+  const SOURCE = { official: "官方規格", seller: "賣家確認", agent: "AI 推測" };
   const badge = s => `<span class="badge ${esc(s)}">${esc(STATUS[s] || s)}</span>`;
   const row = (k, v) => v === undefined || v === null || v === "" ? "" : `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`;
 
+  const fmt = v => v === true ? "是" : v === false ? "否" : v;
+  const specRow = sp => `<tr><td>${esc(sp.label || sp.key)}</td><td>${esc(fmt(sp.value))}${sp.unit ? " " + esc(sp.unit) : ""}
+    <span class="src">${esc(SOURCE[sp.source] || sp.source)}</span></td></tr>`;
+
   function details(l) {
-    let html = `<table>${row("編號", "#" + l.id)}${row("品類", l.category)}${row("狀況", l.condition)}
-      ${row("地點", l.location)}${row("賣家", l.seller)}${row("上架時間", l.created_at)}</table>`;
-    if (l.floor_price !== undefined) {
-      html += `<div class="debug"><b>除錯資料</b><table>${row("最低價", money(l.floor_price))}
-        ${row("自動接受價", money(l.auto_accept_price))}${row("賣家 email", l.seller_email)}</table>`;
-      for (const n of l.negotiations || []) {
-        html += `<table>${row("議價 #" + n.id, (STATE[n.state] || n.state) + "，第 " + n.round + " 輪")}
-          ${row("買家 / 預算", n.buyer + " / " + money(n.budget))}
-          ${row("賣家 / 買家出價", money(n.seller_offer) + " / " + money(n.buyer_offer))}
-          ${row("談成價", money(n.agreed_price))}</table>`;
-      }
-      html += `</div>`;
+    const moving = [l.needs_disassembly && "需要拆裝", l.needs_truck && "需要貨車"].filter(Boolean).join("、");
+    let html = `${l.description ? `<div class="desc">${esc(l.description)}</div>` : ""}
+      <table>${(l.specs || []).map(specRow).join("")}
+      ${row("尺寸", l.size)}${row("搬運", moving)}${row("狀況", l.condition)}${row("地點", l.location)}
+      ${row("可面交", (l.seller_stations || []).join("、"))}${row("賣家", l.seller)}${row("編號", "#" + l.id)}</table>`;
+    if ((l.qa || []).length) {
+      html += `<div class="qa"><b>買家問答</b>` +
+        l.qa.map(q => `<div>問：${esc(q.question)}<br>答：${esc(q.answer)}</div>`).join("") + `</div>`;
+    }
+    if (l.debug) {
+      html += `<div class="debug"><b>除錯資料</b><table>`;
+      for (const q of l.debug.questions) html += row("問題 #" + q.id, `${q.question} → ${q.answer || "（未回答）"}${q.public ? "" : "（不公開）"}`);
+      for (const d of l.debug.deals) html += row("交易 #" + d.id, `${d.buyer}，${STATE[d.state] || d.state}${d.meetup_at ? "，" + d.meetup_at + " " + d.meetup_station : ""}`);
+      html += `</table></div>`;
     }
     return html;
   }
+
+  const unknown = l => (l.unknown_conditions || []).length
+    ? `<div class="warn">介紹沒寫到：${esc(l.unknown_conditions.map(c => c.key).join("、"))}</div>` : "";
 
   async function loadPhoto(listingId, el) {
     try {
@@ -155,13 +169,13 @@ APP_HTML = r"""<!doctype html>
 
   function renderGallery(d) {
     const ls = d.listings || [];
-    if (!ls.length) { root.className = "empty"; root.textContent = "目前沒有商品。"; return; }
+    if (!ls.length) { root.className = "empty"; root.textContent = d.headline || "目前沒有商品。"; return; }
     root.className = "";
-    root.innerHTML = `<h2>DealMate 商品（${ls.length}）${d.debug ? "・除錯模式" : ""}</h2><div class="grid">` +
+    root.innerHTML = `<h2>${esc(d.headline || `DealMate 商品（${ls.length}）`)}${d.debug ? "・除錯模式" : ""}</h2><div class="grid">` +
       ls.map(l => `<div class="card"><div class="ph" id="ph-${l.id}">${l.has_photo ? "載入照片…" : "沒有照片"}</div>
         <div class="body"><div class="title">${esc(l.title)}${badge(l.status)}</div>
-        <div class="price">${money(l.ask_price)}</div>
-        <div class="meta">${esc([l.condition, l.location].filter(Boolean).join("・"))}</div>
+        <div class="price">${money(l.price)}</div>
+        <div class="meta">${esc([l.condition, l.location].filter(Boolean).join("・"))}</div>${unknown(l)}
         <details><summary>詳細資料</summary>${details(l)}</details></div></div>`).join("") + `</div>`;
     for (const l of ls) if (l.has_photo) loadPhoto(l.id, document.getElementById("ph-" + l.id));
   }
@@ -187,7 +201,7 @@ APP_HTML = r"""<!doctype html>
     root.innerHTML = `${d.headline ? `<h2>${esc(d.headline)}</h2>` : ""}<div class="one">
       <div class="ph" id="ph">${l.has_photo ? "載入照片…" : "還沒有照片"}</div>
       <div><div class="title" style="font-size:16px">${esc(l.title)}${badge(l.status)}</div>
-        <div class="price">${money(l.ask_price)}</div>${details(l)}
+        <div class="price">${money(l.price)}</div>${details(l)}
         <div id="up"></div></div></div>`;
     const ph = document.getElementById("ph");
     if (l.has_photo) loadPhoto(l.id, ph);
@@ -230,6 +244,6 @@ apps.add_html_resource(
     APP_HTML,
     name="DealMate",
     title="DealMate 商品卡片",
-    description="Product cards with photos, and in-chat photo upload for sellers.",
+    description="Product cards with photos, specs and Q&A, and in-chat photo upload for sellers.",
     prefers_border=True,
 )

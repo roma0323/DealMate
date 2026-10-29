@@ -1,13 +1,12 @@
 [project]
 name = "dealmate"
 version = "0.1.0"
-description = "Add your description here"
+description = "DealMate: a second-hand trading agent as an MCP server"
 authors = [
     { name = "roma_0323", email = "r911223oger@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=2.3.0",
     "mcp[cli]>=2.3.0",
     "python-dotenv>=1.2.4",
 ]
