@@ -13,3 +13,6 @@ wheels/
 .env
 dealmate.db
 photos/
+
+# macOS
+.DS_Store

@@ -12,7 +12,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.types import Image
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import db, engine, photos
+from . import db, engine, photos, ui
+from .ui import ui_meta
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -25,10 +26,10 @@ mcp = MCPServer(
         "the user only describes what they want, answers questions when asked, and confirms the final deal. "
         "Always call register_user first with the user's name and email if they have not registered. "
         "Pass the same `user` name on every later call. Reply to the user in Traditional Chinese. "
-        "Sellers can add a photo: give them the upload_url that create_listing returns."
+        "Sellers add a photo with the upload button on the listing card that create_listing shows."
     ),
+    extensions=[ui.apps],
 )
-photos.register_routes(mcp)
 
 
 def _require_user(conn, user: str) -> dict:
@@ -54,7 +55,7 @@ def register_user(name: str, email: str) -> dict:
     return {"user_id": u["id"], "name": u["name"], "email": u["email"]}
 
 
-@mcp.tool()
+@mcp.tool(meta=ui_meta())
 def create_listing(
     user: str,
     category: str,
@@ -75,8 +76,8 @@ def create_listing(
       below it (but above the floor), the agent will ask them first
     `category` is a short keyword used for matching, e.g. "水壺", "耳機", "書".
 
-    Returns `upload_url`: always give this link to the seller so they can add a photo
-    of the item from their phone or computer (the chat attachment itself can't be passed on).
+    The result is shown as a listing card with an upload button, so the seller can add
+    a photo right in the chat. Tell the seller to use that button.
     """
     if not (floor_price <= auto_accept_price <= ask_price):
         raise ToolError("價格需符合：底價 ≤ 自動接受價 ≤ 開價。")
@@ -92,43 +93,109 @@ def create_listing(
         neg_id = engine.find_match_for_listing(conn, listing_id)
     if neg_id:
         engine.start_negotiation_async(neg_id)
+    with db.connect() as conn:
+        listing = _public_listing(conn, listing_id)
     return {
+        "view": "listing",
+        "headline": "上架成功",
         "listing_id": listing_id,
         "matched": bool(neg_id),
         "negotiation_id": neg_id,
-        "upload_url": photos.upload_url(token),
+        "listing": listing,
+        "upload_token": token,
     }
+
+
+def _public_listing(conn, listing_id: int) -> dict | None:
+    """What anyone may see about a listing: no floor price, auto-accept price or email."""
+    l = db.row(
+        conn,
+        "SELECT l.id, l.title, l.category, l.condition, l.location, l.ask_price, l.status, l.created_at, "
+        "l.photo_path, s.name AS seller FROM listings l JOIN users s ON s.id = l.seller_id WHERE l.id = ?",
+        listing_id,
+    )
+    if l is None:
+        return None
+    l["has_photo"] = photos.photo_file(l) is not None
+    del l["photo_path"]
+    return l
+
+
+@mcp.tool(meta=ui_meta())
+def show_listing(user: str, listing_id: int) -> dict:
+    """Show one item as a card with its photo and details.
+
+    For the item's seller the card also has an upload button for adding or changing the photo.
+    """
+    with db.connect() as conn:
+        u = _require_user(conn, user)
+        listing = _public_listing(conn, listing_id)
+        if listing is None:
+            raise ToolError("找不到這件商品。")
+        mine = db.row(conn, "SELECT 1 AS yes FROM listings WHERE id = ? AND seller_id = ?", listing_id, u["id"])
+        token = photos.ensure_upload_token(conn, listing_id) if mine else None
+    result = {"view": "listing", "listing": listing}
+    if token:
+        result["upload_token"] = token
+    return result
+
+
+@mcp.tool(meta=ui_meta(app_only=True))
+def app_get_photo(listing_id: int) -> dict:
+    """Used by the DealMate card to display a listing photo. Not for the model."""
+    with db.connect() as conn:
+        listing = db.row(conn, "SELECT photo_path FROM listings WHERE id = ?", listing_id)
+    path = photos.photo_file(listing) if listing else None
+    if path is None:
+        raise ToolError("這件商品還沒有照片。")
+    data = path.read_bytes()
+    mime = photos.detect_type(data[:16])[1]
+    return {"listing_id": listing_id, "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
+
+
+@mcp.tool(meta=ui_meta(app_only=True))
+def app_upload_photo(upload_token: str, image_base64: str) -> dict:
+    """Used by the DealMate card's upload button. Not for the model."""
+    try:
+        data = base64.b64decode(image_base64.split(",")[-1])
+    except (binascii.Error, ValueError):
+        raise ToolError("圖片內容無法解讀。")
+    with db.connect() as conn:
+        listing = db.row(conn, "SELECT id FROM listings WHERE upload_token = ?", upload_token)
+        if listing is None:
+            raise ToolError("上傳代碼無效。")
+        try:
+            photos.save_photo(conn, listing["id"], data)
+        except ValueError as e:
+            raise ToolError(str(e))
+    return {"listing_id": listing["id"], "has_photo": True}
 
 
 @mcp.tool()
 def upload_photo(user: str, listing_id: int, image_base64: str) -> dict:
     """Seller: attach a photo to their listing by sending the image as base64.
 
-    Only practical for small images. If the image is large, or this fails, give the
-    seller the upload_url from create_listing / check_status instead.
+    Only practical for small images. If the image is large, or this fails, ask the
+    seller to use the upload button on the listing card (show_listing) instead.
     """
     try:
         data = base64.b64decode(image_base64.split(",")[-1], validate=False)
     except (binascii.Error, ValueError):
-        raise ToolError("圖片的 base64 內容無法解讀，請改用上傳連結。")
+        raise ToolError("圖片的 base64 內容無法解讀，請改用商品卡片上的上傳按鈕。")
     with db.connect() as conn:
         seller = _require_user(conn, user)
         listing = db.row(conn, "SELECT id FROM listings WHERE id = ? AND seller_id = ?", listing_id, seller["id"])
         if listing is None:
             raise ToolError("找不到這位賣家的這件商品。")
         try:
-            url = photos.save_photo(conn, listing_id, data)
+            photos.save_photo(conn, listing_id, data)
         except ValueError as e:
-            raise ToolError(f"{e} 也可以改用上傳連結。")
-    return {"listing_id": listing_id, "photo_url": url}
+            raise ToolError(f"{e} 也可以改用商品卡片上的上傳按鈕。")
+    return {"listing_id": listing_id, "has_photo": True}
 
 
-@mcp.tool()
-def view_listing_photo(user: str, listing_id: int) -> Image:
-    """Look at the photo of a listing, so you can describe the item to the user.
-
-    The seller can view their own listings; a buyer can view a listing they are negotiating for.
-    """
+def _viewable_photo(user: str, listing_id: int) -> tuple[dict, bytes]:
+    """The listing and its photo bytes, if `user` is its seller or a buyer negotiating for it."""
     with db.connect() as conn:
         u = _require_user(conn, user)
         listing = db.row(
@@ -146,7 +213,39 @@ def view_listing_photo(user: str, listing_id: int) -> Image:
     path = photos.photo_file(listing)
     if path is None:
         raise ToolError("這件商品還沒有照片。")
-    return Image(data=path.read_bytes(), format=photos.detect_type(path.read_bytes()[:16])[0].replace("jpg", "jpeg"))
+    return listing, path.read_bytes()
+
+
+@mcp.tool()
+def view_listing_photo_for_ai(user: str, listing_id: int) -> Image:
+    """Look at a listing's photo yourself, so you can describe the item to the user.
+
+    Returns the image for you (the AI) to see; it is not shown to the user as a file.
+    To show the photo to the user, use view_listing_photo_for_human.
+    The seller can view their own listings; a buyer can view a listing they are negotiating for.
+    """
+    _, data = _viewable_photo(user, listing_id)
+    return Image(data=data, format=photos.detect_type(data[:16])[0].replace("jpg", "jpeg"))
+
+
+@mcp.tool()
+def view_listing_photo_for_human(user: str, listing_id: int) -> dict:
+    """Download a listing's photo as a base64 encoded string, to show it to the user.
+
+    Same shape as a Drive file download: `content` is the file's bytes in base64,
+    with `mimeType` and `title` (a file name). Decode `content` into a file named
+    `title` and present that file to the user so they can see the photo.
+    To look at the photo yourself instead, use view_listing_photo_for_ai.
+    The seller can view their own listings; a buyer can view a listing they are negotiating for.
+    """
+    listing, data = _viewable_photo(user, listing_id)
+    ext, mime = photos.detect_type(data[:16])
+    return {
+        "content": base64.b64encode(data).decode(),
+        "id": f"listing-{listing_id}",
+        "mimeType": mime,
+        "title": f"{listing['title']}.{ext}",
+    }
 
 
 @mcp.tool()
@@ -169,6 +268,62 @@ def create_want(user: str, category: str, description: str, budget: int, locatio
     return {"want_id": want_id, "matched": bool(neg_id), "negotiation_id": neg_id}
 
 
+DEBUG = os.environ.get("DEALMATE_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+
+@mcp.tool(meta=ui_meta())
+def browse_listings(include_closed: bool = False) -> dict:
+    """Browse every item on DealMate with its public details.
+    The result is shown as product cards with photos.
+
+    By default only items still for sale or being negotiated are shown; set
+    include_closed to also show sold and closed ones. Use this when the user wants
+    to see what is available. (With DEALMATE_DEBUG=1 on the server, the result also
+    includes private fields for debugging: floor and auto-accept prices, emails, wants and negotiations.)
+    """
+    status_filter = "" if include_closed else "WHERE l.status IN ('open', 'matched')"
+    with db.connect() as conn:
+        listings = db.rows(
+            conn,
+            f"""
+            SELECT l.id, l.title, l.category, l.condition, l.location, l.ask_price, l.status,
+                   l.created_at, l.photo_path, l.floor_price, l.auto_accept_price,
+                   s.name AS seller, s.email AS seller_email
+            FROM listings l JOIN users s ON s.id = l.seller_id
+            {status_filter}
+            ORDER BY l.id
+            """,
+        )
+        for l in listings:
+            l["has_photo"] = photos.photo_file(l) is not None
+            del l["photo_path"]
+            if DEBUG:
+                l["negotiations"] = db.rows(
+                    conn,
+                    """
+                    SELECT n.id, n.state, n.round, n.seller_offer, n.buyer_offer, n.agreed_price,
+                           b.name AS buyer, w.budget
+                    FROM negotiations n JOIN wants w ON w.id = n.want_id JOIN users b ON b.id = w.buyer_id
+                    WHERE n.listing_id = ? ORDER BY n.id
+                    """,
+                    l["id"],
+                )
+            else:
+                # Private to the seller: never shown to other users.
+                for key in ("floor_price", "auto_accept_price", "seller_email"):
+                    del l[key]
+        result = {"view": "gallery", "count": len(listings), "listings": listings}
+        if DEBUG:
+            result["debug"] = True
+            result["wants"] = db.rows(
+                conn,
+                "SELECT w.id, w.category, w.description, w.budget, w.status, b.name AS buyer, b.email AS buyer_email "
+                "FROM wants w JOIN users b ON b.id = w.buyer_id ORDER BY w.id",
+            )
+            result["users"] = db.rows(conn, "SELECT id, name, email, created_at FROM users ORDER BY id")
+    return result
+
+
 @mcp.tool()
 def check_status(user: str) -> dict:
     """Show the user's listings, wants and negotiations, including the offer history
@@ -187,8 +342,7 @@ def check_status(user: str) -> dict:
             u["id"],
         )
         for l in listings:
-            l["photo_url"] = photos.photo_url(l["id"]) if photos.photo_file(l) else None
-            l["upload_url"] = photos.upload_url(photos.ensure_upload_token(conn, l["id"]))
+            l["has_photo"] = photos.photo_file(l) is not None
             del l["photo_path"]
         wants = db.rows(
             conn, "SELECT id, category, description, budget, status FROM wants WHERE buyer_id = ?", u["id"]
@@ -209,7 +363,7 @@ def check_status(user: str) -> dict:
             u["id"], u["id"], u["id"], u["id"],
         )
         for n in negs:
-            n["photo_url"] = photos.photo_url(n["listing_id"]) if photos.photo_file(n) else None
+            n["has_photo"] = photos.photo_file(n) is not None
             del n["photo_path"]
             # Only show a pending question to the party it is addressed to.
             n["waiting_for_me"] = n["state"] == "waiting_user" and n["pending_party"] == n["my_role"]

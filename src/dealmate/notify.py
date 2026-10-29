@@ -34,7 +34,7 @@ def build_message(sender: str, to: str, subject: str, body: str, image: Path | N
             subtype="html",
         )
         data = image.read_bytes()
-        from .photos import detect_type  # local import: photos imports starlette, notify stays light
+        from .photos import detect_type  # local import: photos imports db, notify stays light
 
         kind = detect_type(data) or ("jpg", "image/jpeg")
         maintype, subtype = kind[1].split("/")
